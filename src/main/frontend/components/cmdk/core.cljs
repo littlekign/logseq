@@ -84,11 +84,21 @@
   (when (and (not (string/blank? q))
              (not (#{"config.edn" "custom.js" "custom.css"} q))
              (not config/publishing?))
-    (let [class? (string/starts-with? q "#")]
-      (->> [{:text (if class? "Create tag" "Create page")       :icon "new-page"
+    (let [class? (string/starts-with? q "#")
+          class-name (get-class-from-input q)
+          class (ldb/class? (db/get-case-page class-name))]
+      (->> [{:text (cond
+                     class "Configure tag"
+                     class? "Create tag"
+                     :else "Create page")
+             :icon "new-page"
              :icon-theme :gray
              :info (if class?
-                     (str "Create class called '" (get-class-from-input q) "'")
+                     (let [class-name (get-class-from-input q)
+                           class (db/get-case-page class-name)]
+                       (if class
+                         (str "Configure #" class-name)
+                         (str "Create tag called '" class-name "'")))
                      (str "Create page called '" q "'"))
              :source-create :page}]
            (remove nil?)))))
@@ -281,14 +291,16 @@
 (defn- page-item
   [repo page]
   (let [entity (db/entity [:block/uuid (:block/uuid page)])
-        source-page (model/get-alias-source-page repo (:db/id entity))
+        source-page (or (model/get-alias-source-page repo (:db/id entity))
+                        (:alias page))
         icon (get-page-icon entity)
         title (block-handler/block-unique-title page)
         title' (if source-page (str title " -> alias: " (:block/title source-page)) title)]
     (hash-map :icon icon
               :icon-theme :gray
               :text title'
-              :source-page (or source-page page))))
+              :source-page (or source-page page)
+              :alias (:alias page))))
 
 (defn- block-item
   [repo block current-page !input]
@@ -436,9 +448,11 @@
 
 (defn- get-highlighted-page-uuid-or-name
   [state]
-  (let [highlighted-item (some-> state state->highlighted-item)]
-    (or (:block/uuid (:source-block highlighted-item))
-        (:block/uuid (:source-page highlighted-item)))))
+  (let [highlighted-item (some-> state state->highlighted-item)
+        block (or (:alias highlighted-item)
+                  (:source-block highlighted-item)
+                  (:source-page highlighted-item))]
+    (:block/uuid block)))
 
 (defmethod handle-action :open-page [_ state _event]
   (when-let [page-name (get-highlighted-page-uuid-or-name state)]
@@ -553,7 +567,7 @@
                      create-page? (page-handler/<create! @!input {:redirect? true}))]
       (shui/dialog-close! :ls-dialog-cmdk)
       (when (and create-class? result)
-        (state/sidebar-add-block! (state/get-current-repo) (:db/id result) :block)))))
+        (state/pub-event! [:dialog/show-block result {:tag-dialog? true}])))))
 
 (defn- get-filter-user-input
   [input]
