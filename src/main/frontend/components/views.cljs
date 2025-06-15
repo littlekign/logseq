@@ -1524,11 +1524,17 @@
            (shui/table-footer (add-new-row (:view-entity option) table)))]]))))
 
 (rum/defc list-view < rum/static
-  [{:keys [config] :as option} _view-entity {:keys [rows]} *scroller-ref]
+  [{:keys [config ref-matched-children-ids] :as option} view-entity {:keys [rows]} *scroller-ref]
   (let [lazy-item-render (fn [rows idx]
                            (lazy-item rows idx (assoc option :list-view? true)
                                       (fn [block]
-                                        (block-container (assoc config :list-view? true :block-level 1) block))))
+                                        (let [config' (cond->
+                                                       (assoc config
+                                                              :list-view? true
+                                                              :block-level 1)
+                                                        (= :linked-references (:logseq.property.view/feature-type view-entity))
+                                                        (assoc :ref-matched-children-ids ref-matched-children-ids))]
+                                          (block-container config' block)))))
         list-cp (fn [rows]
                   (when (seq rows)
                     (ui/virtualized-list
@@ -2012,9 +2018,53 @@
   [view opts]
   (state/<invoke-db-worker :thread-api/get-view-data (state/get-current-repo) (:db/id view) opts))
 
+(defn- get-query-columns
+  [config properties]
+  (->> properties
+       (map db/entity)
+       (ldb/sort-by-order)
+       ((fn [cs] (build-columns config cs {:add-tags-column? false})))))
+
+(defn- load-view-data-aux
+  [view-entity view-parent {:keys [query? query-entity-ids sorting filters input
+                                   view-feature-type group-by-property-ident
+                                   set-data! set-ref-pages-count! set-ref-matched-children-ids! set-properties! set-loading!]}]
+  (c.m/run-task*
+   (m/sp
+     (let [need-query? (and query? (seq query-entity-ids) (or sorting filters (not (string/blank? input))))]
+       (cond
+         (and query? (empty? query-entity-ids))
+         (set-data! nil)
+         (and query? (not (or sorting filters)) (string/blank? input))
+         (set-data! query-entity-ids)
+         :else
+         (when (or (not query?) need-query?)
+           (try
+             (let [{:keys [data ref-pages-count ref-matched-children-ids properties]}
+                   (c.m/<?
+                    (<load-view-data view-entity
+                                     (cond->
+                                      {:view-for-id (or (:db/id (:logseq.property/view-for view-entity))
+                                                        (:db/id view-parent))
+                                       :view-feature-type view-feature-type
+                                       :group-by-property-ident group-by-property-ident
+                                       :input input
+                                       :filters filters
+                                       :sorting sorting}
+                                       query?
+                                       (assoc :query-entity-ids query-entity-ids))))]
+               (set-data! data)
+               (when ref-pages-count
+                 (set-ref-pages-count! ref-pages-count)
+                 (set-ref-matched-children-ids! ref-matched-children-ids))
+               (set-properties! properties))
+             (finally
+               (set-loading! false)))))))))
+
 (rum/defc view-aux
-  [view-entity {:keys [view-parent view-feature-type data query-entity-ids set-view-entity!] :as option}]
+  [view-entity {:keys [config view-parent view-feature-type data query-entity-ids set-view-entity!] :as option}]
   (let [[input set-input!] (hooks/use-state "")
+        [properties set-properties!] (hooks/use-state nil)
         db-based? (config/db-based-graph?)
         group-by-property (:logseq.property.view/group-by-property view-entity)
         display-type (if (config/db-based-graph?)
@@ -2039,39 +2089,19 @@
         view-filters (:logseq.property.table/filters view-entity)
         [filters set-filters!] (rum/use-state (or view-filters {}))
         query? (= view-feature-type :query-result)
+        option (if query? (assoc option :columns (get-query-columns config properties)) option)
         [loading? set-loading!] (hooks/use-state (not query?))
         [data set-data!] (hooks/use-state data)
         [ref-pages-count set-ref-pages-count!] (hooks/use-state nil)
+        [ref-matched-children-ids set-ref-matched-children-ids!] (hooks/use-state nil)
         load-view-data (fn load-view-data []
-                         (c.m/run-task*
-                          (m/sp
-                            (let [need-query? (and query? (seq query-entity-ids) (or sorting filters (not (string/blank? input))))]
-                              (cond
-                                (and query? (empty? query-entity-ids))
-                                (set-data! nil)
-                                (and query? (not (or sorting filters)) (string/blank? input))
-                                (set-data! query-entity-ids)
-                                :else
-                                (when (or (not query?) need-query?)
-                                  (try
-                                    (let [{:keys [data ref-pages-count]}
-                                          (c.m/<?
-                                           (<load-view-data view-entity
-                                                            (cond->
-                                                             {:view-for-id (or (:db/id (:logseq.property/view-for view-entity))
-                                                                               (:db/id view-parent))
-                                                              :view-feature-type view-feature-type
-                                                              :group-by-property-ident group-by-property-ident
-                                                              :input input
-                                                              :filters filters
-                                                              :sorting sorting}
-                                                              query?
-                                                              (assoc :query-entity-ids query-entity-ids))))]
-                                      (set-data! data)
-                                      (when ref-pages-count
-                                        (set-ref-pages-count! ref-pages-count)))
-                                    (finally
-                                      (set-loading! false)))))))))]
+                         (load-view-data-aux view-entity view-parent
+                                             {:query? query?
+                                              :query-entity-ids query-entity-ids
+                                              :sorting sorting :filters filters :input input
+                                              :view-feature-type view-feature-type :group-by-property-ident group-by-property-ident
+                                              :set-data! set-data! :set-ref-pages-count! set-ref-pages-count! :set-ref-matched-children-ids! set-ref-matched-children-ids!
+                                              :set-properties! set-properties! :set-loading! set-loading!}))]
     (let [sorting-filters {:sorting sorting
                            :filters filters}]
       (hooks/use-effect!
@@ -2104,10 +2134,17 @@
                                           :items-count (if (every? number? data)
                                                          (count data)
                                                          ;; grouped
-                                                         (reduce (fn [total [_ col]]
-                                                                   (+ total (count col))) 0 data))
+                                                         (let [f (fn count-col
+                                                                   [data]
+                                                                   (reduce (fn [total [_k col]]
+                                                                             (if (and (vector? (first col))
+                                                                                      (uuid? (ffirst col)))
+                                                                               (+ total (count-col col))
+                                                                               (+ total (count col)))) 0 data))]
+                                                           (f data)))
                                           :group-by-property-ident group-by-property-ident
                                           :ref-pages-count ref-pages-count
+                                          :ref-matched-children-ids ref-matched-children-ids
                                           :display-type display-type
                                           :load-view-data load-view-data
                                           :set-view-entity! set-view-entity!))])))
